@@ -166,6 +166,41 @@ class ReservationRescheduleIn(_ReservationWindowBase):
     )
 
 
+class ReservationSwapLegIn(BaseModel):
+    """时段交换的一条腿：预约 ID + 客户端所持乐观锁版本。"""
+
+    reservation_id: int = Field(
+        ge=1,
+        description="参与交换的预约 ID",
+        examples=[1],
+    )
+    expected_version: int = Field(
+        ge=1,
+        description="客户端上次读到的该预约版本；与当前版本一致才执行交换",
+        examples=[1],
+    )
+
+
+class ReservationSwapIn(BaseModel):
+    """预约时段原子交换请求：两条不同的 active 预约互换起止时刻。"""
+
+    first: ReservationSwapLegIn = Field(description="第一条预约及其期望版本")
+    second: ReservationSwapLegIn = Field(description="第二条预约及其期望版本")
+
+    @model_validator(mode="after")
+    def _validate_distinct(self) -> "ReservationSwapIn":
+        if self.first.reservation_id == self.second.reservation_id:
+            raise ValueError("reservation ids must be different")
+        return self
+
+
+class ReservationSwapOut(BaseModel):
+    """时段原子交换结果：双方交换后的最新预约状态（version 各加 1）。"""
+
+    first: ReservationOut
+    second: ReservationOut
+
+
 class ReservationHoldIn(_ReservationWindowBase):
     """临时保留创建请求：幂等 hold_key + 半开区间参与者占用 + TTL 秒数。"""
 

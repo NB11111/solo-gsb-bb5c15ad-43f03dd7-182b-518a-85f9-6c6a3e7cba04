@@ -2,7 +2,8 @@
 
 基于 **Python + FastAPI + 标准库 `zoneinfo`** 的会议候选时段聚合服务，
 并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、
-软删除取消、单事务冲突检测、**可校验的 SHA-256 哈希链变更历史**、
+软删除取消、**两条预约时段原子交换**、单事务冲突检测、
+**可校验的 SHA-256 哈希链变更历史**、
 **预约临时保留 / 确认**、**预约候补队列**）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
@@ -33,14 +34,14 @@
 ```
 app/
   scheduling.py    # 聚合核心：本地时刻换算、跨午夜拆分、扫描线、排序
-  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测、历史读取、取消后 FIFO 候补晋升
+  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、时段原子交换、单事务冲突检测、历史读取、取消后 FIFO 候补晋升
   holds.py         # 临时保留核心：TTL 占位、事务内惰性过期、确认转正式预约
   waitlist.py      # 候补核心：可预约直订/否则入队、request_id 幂等、取消事务内 FIFO 扫描晋升
   audit.py         # 审计事件：canonical JSON、SHA-256 哈希链追加与整链重验
   db.py            # SQLite 连接管理、建表与无损迁移（补列 / 补 baseline 事件）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、临时保留、候补 FIFO 晋升、哈希链/篡改/迁移）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、时段交换、临时保留、候补 FIFO 晋升、哈希链/篡改/迁移）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -400,6 +401,113 @@ curl -s -X DELETE 'http://localhost:8000/api/v1/reservations/1?expected_version=
 
 其他错误：`404`（预约不存在）、`422`（缺少 `expected_version` 或其值 `< 1`）。
 
+### `POST /api/v1/reservations/swap`
+
+**时段原子交换**：两条不同的 `active` 预约在**单个事务**内互换
+`start_utc` / `end_utc`；参与者、`request_id`、`created_at` 均保持不变。
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `first.reservation_id` | 正整数 | 第一条预约 ID |
+| `first.expected_version` | 正整数 | 客户端上次读到的第一条预约版本；与当前版本一致才执行 |
+| `second.reservation_id` | 正整数 | 第二条预约 ID（**必须与第一条不同**） |
+| `second.expected_version` | 正整数 | 客户端上次读到的第二条预约版本；与当前版本一致才执行 |
+
+语义：
+
+- 整个流程（双方存在性 → 均未取消 → 双版本匹配 → 冲突检查 → 互换）
+  在单个 `BEGIN IMMEDIATE` 事务内完成；**任一步失败都整体回滚**，
+  两条预约及其参与者占用、审计链均保持原状。
+- 任一预约不存在 → `404`。
+- 任一预约已取消 → `409`：取消是终态，交换**不会**使其复活。
+- 任一 `expected_version` 与对应预约当前版本不一致 → `409`，
+  响应给出该预约的 `current_version`；客户端可重新读取后重试。
+- **冲突检查**：交换后第一条预约的参与者落在第二条的原时段、反之亦然。
+  对**双方各自的新时段**按半开区间规则检查与**其他进行中预约**
+  （`reservation_id NOT IN (first, second)`，**排除交换双方**自身旧占用）
+  及**未过期 pending 保留**的参与者重叠；任一冲突 → `409` + `conflicts`
+  明细，整体回滚。交换双方互为“新时段上的另一方”不算冲突
+  （双方交换前均为 active，共享参与者的占用集合交换后不变）。
+- 成功 → `200`：两条预约的 `start_utc` / `end_utc` 互换，`version`
+  **各加 1**，返回双方交换后的最新状态。
+- **审计**：成功交换在同一事务为**双方各追加一条 `rescheduled` 哈希链事件**
+  （快照为各自交换后的新状态）；任一步失败不产生事件。
+
+请求示例（把预约 #1 与 #2 的时段互换）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reservations/swap \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first":  {"reservation_id": 1, "expected_version": 1},
+    "second": {"reservation_id": 2, "expected_version": 3}
+  }'
+```
+
+成功响应（`200`，#1 拿到 #2 的原时段 16:00–17:00，#2 拿到 #1 的原时段
+13:00–14:00，双方版本各 +1）：
+
+```json
+{
+  "first": {
+    "reservation_id": 1,
+    "request_id": "req-9f3a",
+    "start_utc": "2026-03-09T16:00:00Z",
+    "end_utc": "2026-03-09T17:00:00Z",
+    "participants": ["alice", "bob"],
+    "version": 2,
+    "status": "active",
+    "canceled_at": null,
+    "created_at": "2026-09-17T20:42:39.634009Z"
+  },
+  "second": {
+    "reservation_id": 2,
+    "request_id": "req-77bc",
+    "start_utc": "2026-03-09T13:00:00Z",
+    "end_utc": "2026-03-09T14:00:00Z",
+    "participants": ["carol"],
+    "version": 4,
+    "status": "active",
+    "canceled_at": null,
+    "created_at": "2026-09-18T08:11:02.111111Z"
+  }
+}
+```
+
+错误示例——任一预约不存在（`404`）：
+
+```json
+{ "detail": "reservation #2 not found" }
+```
+
+任一预约已取消（`409`）：
+
+```json
+{ "detail": "reservation #1 has been canceled", "current_version": 2 }
+```
+
+任一版本过期（`409`，`current_version` 属于版本不符的那一条预约）：
+
+```json
+{
+  "detail": "expected_version does not match current version of reservation #2",
+  "current_version": 3
+}
+```
+
+交换后的新时段与第三方预约或未过期保留冲突（`409`，整体回滚）：
+
+```json
+{
+  "detail": "reservation conflict: participant 'alice' overlaps reservation #3",
+  "conflicts": [{"reservation_id": 3, "participant_id": "alice"}]
+}
+```
+
+其他错误：`422`（两条预约 ID 相同、`reservation_id` / `expected_version < 1`、
+缺少字段等）。
+
 ### `POST /api/v1/reservation-holds`
 
 创建**预约临时保留**（正式预约前的短时占位）。请求体：
@@ -661,8 +769,9 @@ curl -s http://localhost:8000/api/v1/reservation-waitlist/req-wait-2
   **响应不包含任何历史**，仅在 `detail` 中给出失败位置；
 - 校验通过 → `200`。
 
-**什么时候产生事件**：仅在创建/改期/取消**成功提交**时，于**同一数据库事务**
-内追加一条事件（与业务写入同生共死，不会出现有预约无事件或反之）；
+**什么时候产生事件**：仅在创建/改期/取消/交换**成功提交**时，于**同一数据库事务**
+内追加一条事件（与业务写入同生共死，不会出现有预约无事件或反之；交换会在
+两条预约各自的链上各追加一条 `rescheduled` 事件）；
 失败请求（冲突、版本不符等）与**幂等重放**（相同 `request_id` 重试创建、
 原 `expected_version` 重试取消）**不产生事件**。
 
@@ -671,7 +780,7 @@ curl -s http://localhost:8000/api/v1/reservation-waitlist/req-wait-2
 | 字段 | 说明 |
 | --- | --- |
 | `seq` | 该预约内**从 1 递增**的序号 |
-| `action` | `created`（创建）、`rescheduled`（改期）、`canceled`（取消）、`baseline`（初始化时为既有预约补写） |
+| `action` | `created`（创建）、`rescheduled`（改期或时段交换）、`canceled`（取消）、`baseline`（初始化时为既有预约补写） |
 | `timestamp` | 事件时间（UTC ISO 8601；与业务写入同一时钟读数） |
 | `snapshot` | 事件发生后的预约完整快照（结构同预约响应：id、request_id、起止时刻、参与者、version、status、canceled_at、created_at） |
 | `prev_hash` | 上一条事件的哈希（64 位十六进制）；**首条为 64 个 `0`** |
@@ -766,6 +875,14 @@ for ev in history["events"]:
   同一结果、其他版本 409、取消后改期 409 不复活、并发取消仅一次实际变更；
   以及**旧版数据库启动时无损补齐 `version=1`、`status='active'`、
   `canceled_at=NULL`** 的迁移。
+- **时段原子交换（swap）**：成功交换双方 `start_utc`/`end_utc` 互换、
+  版本各 +1、`request_id`/参与者/`created_at` 不变、占用随新时段平移
+  （旧窗口立即可再约、新窗口被占用）；任一不存在 404、任一已取消 409、
+  任一版本不符 409 并回传该预约 `current_version`；排除交换双方后与
+  第三方预约/未过期保留的新时段冲突 409（相邻不冲突、共享参与者的
+  交换双方互不冲突、过期保留不阻止）；失败整体回滚（双方预约、占用、
+  审计链均不变且不产生事件）；成功为双方各追加一条 `rescheduled`
+  哈希链事件且链可重验；两条 ID 相同 422；并发交换恰一个赢家。
 - **变更历史（哈希链）**：成功创建/改期/取消各在同事务追加事件、序号从 1
   连续递增、快照与版本跟随；`canonical_event` 紧凑/键排序/非 ASCII 不转义；
   首条 `prev_hash` 为 64 个 0，可按公式独立重算整链；GET 历史按序返回、

@@ -1,17 +1,22 @@
-"""会议预约核心逻辑：幂等创建、改期、取消与单事务冲突检测。
+"""会议预约核心逻辑：幂等创建、改期、取消、时段原子交换与单事务冲突检测。
 
 - 参与者 ID 去重并按字典序排序后，作为规范化请求内容参与幂等比较；
 - 区间一律按半开 ``[start, end)`` 处理：首尾相接（相邻）不算冲突；
 - 冲突检查与写入在同一个 ``BEGIN IMMEDIATE`` 事务内完成：
   SQLite 在事务开始时即取写锁，并发请求被串行化；
   任一参与者与已有预约重叠都会整体回滚，不会留下部分写入。
-- 每条预约带单调递增的 ``version``（创建为 1）；改期/取消采用乐观并发控制：
+- 每条预约带单调递增的 ``version``（创建为 1）；改期/取消/交换采用乐观并发控制：
   请求须携带 ``expected_version``，匹配才执行，成功后 ``version`` 加 1。
 - 取消是软删除：``status`` 置为 ``canceled`` 并记录 ``canceled_at``，
   同事务删除全部参与者占用行使时段立即可再预约；预约行保留，
   使相同 ``expected_version`` 的取消重试能幂等返回同一结果，
   且取消后的改期请求被拒绝（不会复活）。
-- 每次**成功**的创建/改期/取消都在同一事务内向 ``reservation_events``
+- 时段原子交换：两条不同的 active 预约在单个 ``BEGIN IMMEDIATE`` 事务内
+  互换 ``start_utc``/``end_utc``（参与者与 ``request_id`` 不变）；
+  交换前校验双方存在、未取消、双版本匹配，并在排除交换双方后检查
+  新时段与其他进行中预约及未过期保留的参与者冲突；任一失败整体回滚，
+  成功后双方 ``version`` 各加 1。
+- 每次**成功**的创建/改期/取消/交换都在同一事务内向 ``reservation_events``
   追加哈希链审计事件（:mod:`app.audit`）；失败请求与幂等重放不产生事件。
 """
 
@@ -165,11 +170,12 @@ def collect_reservation_conflicts(
     start_s: str,
     end_s: str,
     *,
-    exclude_reservation_id: int | None = None,
+    exclude_reservation_ids: Iterable[int] = (),
 ) -> list[dict[str, object]]:
     """收集与**进行中预约**的半开区间冲突（相邻区间因等号不成立而不命中）。
 
-    ``exclude_reservation_id`` 用于改期路径排除自身旧占用。
+    ``exclude_reservation_ids`` 用于改期路径排除自身旧占用、
+    交换路径同时排除交换双方的旧占用。
     """
     conflicts: list[dict[str, object]] = []
     sql = (
@@ -177,10 +183,12 @@ def collect_reservation_conflicts(
         " FROM reservation_participants"
         " WHERE participant_id = ? AND start_utc < ? AND ? < end_utc"
     )
+    excludes = tuple(exclude_reservation_ids)
     params: list[object] = []
-    if exclude_reservation_id is not None:
-        sql += " AND reservation_id != ?"
-        params.append(exclude_reservation_id)
+    if excludes:
+        placeholders = ",".join("?" for _ in excludes)
+        sql += f" AND reservation_id NOT IN ({placeholders})"
+        params.extend(excludes)
     sql += " ORDER BY reservation_id"
     for pid in participants:
         for hit in conn.execute(sql, (pid, end_s, start_s, *params)):
@@ -405,11 +413,11 @@ def reschedule_reservation(
             if expected_version != current_version:
                 raise VersionConflictError(reservation_id, current_version)
 
-            # 半开区间重叠（同创建路径），reservation_id != ? 排除自身：
+            # 半开区间重叠（同创建路径），reservation_id NOT IN 排除自身：
             # 改期前自己在该参与者上的旧占用不应被视为冲突。
             conflicts = collect_reservation_conflicts(
                 conn, participants, start_s, end_s,
-                exclude_reservation_id=reservation_id)
+                exclude_reservation_ids=(reservation_id,))
             # 未过期的临时保留同样占用时段（保留之间不排除自身）
             conflicts.extend(_collect_hold_conflicts(
                 conn, participants, start_s, end_s, now_s))
@@ -465,6 +473,176 @@ def reschedule_reservation(
                 participants=participants,
                 created_at=_parse(row["created_at"]),
                 version=current_version + 1,
+            )
+        except BaseException:
+            # 无活动事务时 rollback 为 no-op；任何失败都保证整体回滚
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def swap_reservations(
+    first_id: int,
+    first_expected_version: int,
+    second_id: int,
+    second_expected_version: int,
+    db_path: str | None = None,
+) -> tuple[Reservation, Reservation]:
+    """时段原子交换：两条不同的 active 预约互换 ``start_utc``/``end_utc``。
+
+    返回 ``(交换后的第一条预约, 交换后的第二条预约)``。参与者、
+    ``request_id`` 与 ``created_at`` 均保持不变；双方 ``version`` 各加 1，
+    并在同一事务内为双方各追加一条 ``rescheduled`` 哈希链审计事件。
+
+    整个流程在单个 ``BEGIN IMMEDIATE`` 事务内完成，任何一步失败都整体回滚，
+    两条预约及其参与者占用、审计链均保持原状：
+
+    1. 任一预约不存在 → :class:`ReservationNotFoundError`（API 层映射为 404）；
+    2. 任一预约已取消 → :class:`ReservationCanceledError`（409）：
+       取消是终态，交换不会使其复活；
+    3. 任一 ``expected_version`` 与对应预约当前版本不一致
+       → :class:`VersionConflictError`（409，携带该预约的 ``current_version``）；
+    4. 冲突检查：交换后第一条预约的参与者落在第二条的原时段、反之亦然。
+       对**双方各自的新时段**按半开区间检查与**其他**进行中预约
+       （``reservation_id NOT IN (first, second)`` 排除交换双方自身旧占用）
+       及未过期临时保留的参与者重叠；有冲突
+       → :class:`ReservationConflictError`（409 + 冲突明细）。
+
+    交换双方互为“新时段上的另一方”：由于双方交换前均为 active，共享参与者
+    在双方原时段上本就不重叠，交换后同一参与者的（参与者, 时段）占用集合
+    不变，故交换双方之间不可能产生新冲突，只需面对第三方占用做检查。
+    """
+    if first_id == second_id:
+        # API 层以 422 拦截；核心层防御：与自身交换没有语义
+        raise ValueError("cannot swap a reservation with itself")
+
+    path = db.ensure_initialized(db_path)
+    conn = db.connect(path)
+    try:
+        # BEGIN IMMEDIATE：与创建/改期/取消路径一致，事务开始即持写锁，
+        # “双方存在性 + 状态 + 双版本 + 冲突检查 + 互换”对并发请求原子。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            now_s = _canon(datetime.now(timezone.utc))
+            _expire_due_holds(conn, now_s)
+
+            row_a = conn.execute(
+                f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
+                (first_id,),
+            ).fetchone()
+            if row_a is None:
+                raise ReservationNotFoundError(first_id)
+            row_b = conn.execute(
+                f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
+                (second_id,),
+            ).fetchone()
+            if row_b is None:
+                raise ReservationNotFoundError(second_id)
+
+            if row_a["status"] == "canceled":
+                # 取消是终态：任何交换都拒绝，预约不会被复活
+                raise ReservationCanceledError(first_id, row_a["version"])
+            if row_b["status"] == "canceled":
+                raise ReservationCanceledError(second_id, row_b["version"])
+            if first_expected_version != row_a["version"]:
+                raise VersionConflictError(first_id, row_a["version"])
+            if second_expected_version != row_b["version"]:
+                raise VersionConflictError(second_id, row_b["version"])
+
+            participants_a = tuple(json.loads(row_a["participants_key"]))
+            participants_b = tuple(json.loads(row_b["participants_key"]))
+            # 交换后：第一条占用第二条的原时段，第二条占用第一条的原时段
+            new_a_start_s, new_a_end_s = row_b["start_utc"], row_b["end_utc"]
+            new_b_start_s, new_b_end_s = row_a["start_utc"], row_a["end_utc"]
+
+            # 半开区间重叠（同创建/改期路径），同时排除交换双方的旧占用：
+            # 对方在自己新时段上的旧占用不算冲突（时段正是从对方换得的）。
+            exclude_ids = (first_id, second_id)
+            conflicts = collect_reservation_conflicts(
+                conn, participants_a, new_a_start_s, new_a_end_s,
+                exclude_reservation_ids=exclude_ids)
+            conflicts.extend(collect_reservation_conflicts(
+                conn, participants_b, new_b_start_s, new_b_end_s,
+                exclude_reservation_ids=exclude_ids))
+            # 未过期的临时保留同样占用时段（保留不参与交换，不排除）
+            conflicts.extend(_collect_hold_conflicts(
+                conn, participants_a, new_a_start_s, new_a_end_s, now_s))
+            conflicts.extend(_collect_hold_conflicts(
+                conn, participants_b, new_b_start_s, new_b_end_s, now_s))
+            if conflicts:
+                raise ReservationConflictError(conflicts)
+
+            # 主表行：仅互换起止时刻并各推进版本；
+            # request_id / participants_key / created_at 保持不变。
+            conn.execute(
+                "UPDATE reservations"
+                " SET start_utc = ?, end_utc = ?, version = version + 1"
+                " WHERE id = ?",
+                (new_a_start_s, new_a_end_s, first_id),
+            )
+            conn.execute(
+                "UPDATE reservations"
+                " SET start_utc = ?, end_utc = ?, version = version + 1"
+                " WHERE id = ?",
+                (new_b_start_s, new_b_end_s, second_id),
+            )
+            # 参与者集合不变：占用行随各自新时段原地平移（不删不插），
+            # 与主表 UPDATE 同事务提交，失败即整体回滚。
+            conn.execute(
+                "UPDATE reservation_participants SET start_utc = ?, end_utc = ?"
+                " WHERE reservation_id = ?",
+                (new_a_start_s, new_a_end_s, first_id),
+            )
+            conn.execute(
+                "UPDATE reservation_participants SET start_utc = ?, end_utc = ?"
+                " WHERE reservation_id = ?",
+                (new_b_start_s, new_b_end_s, second_id),
+            )
+            # 同事务为双方各追加一条 rescheduled 审计事件：
+            # 快照为各自交换后的新状态，now_s 取事务入口时刻
+            for row, rid, s, e, parts in (
+                (row_a, first_id, new_a_start_s, new_a_end_s, participants_a),
+                (row_b, second_id, new_b_start_s, new_b_end_s, participants_b),
+            ):
+                snapshot = audit.build_snapshot(
+                    reservation_id=rid,
+                    request_id=row["request_id"],
+                    start_utc=s,
+                    end_utc=e,
+                    participants=parts,
+                    version=row["version"] + 1,
+                    status="active",
+                    canceled_at=None,
+                    created_at=row["created_at"],
+                )
+                audit.append_event(
+                    conn,
+                    reservation_id=rid,
+                    action="rescheduled",
+                    timestamp=now_s,
+                    snapshot=snapshot,
+                )
+            conn.execute("COMMIT")
+            return (
+                Reservation(
+                    id=first_id,
+                    request_id=row_a["request_id"],
+                    start_utc=_parse(new_a_start_s),
+                    end_utc=_parse(new_a_end_s),
+                    participants=participants_a,
+                    created_at=_parse(row_a["created_at"]),
+                    version=row_a["version"] + 1,
+                ),
+                Reservation(
+                    id=second_id,
+                    request_id=row_b["request_id"],
+                    start_utc=_parse(new_b_start_s),
+                    end_utc=_parse(new_b_end_s),
+                    participants=participants_b,
+                    created_at=_parse(row_b["created_at"]),
+                    version=row_b["version"] + 1,
+                ),
             )
         except BaseException:
             # 无活动事务时 rollback 为 no-op；任何失败都保证整体回滚

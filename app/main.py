@@ -48,6 +48,8 @@ from .schemas import (
     ReservationIn,
     ReservationOut,
     ReservationRescheduleIn,
+    ReservationSwapIn,
+    ReservationSwapOut,
     ReservationWaitlistIn,
     ReservationWaitlistOut,
     SegmentOut,
@@ -71,8 +73,10 @@ app = FastAPI(
         "重复可用区间与 IANA 时区，返回可安排会议的 UTC 候选时段及各自本地时刻。"
         "DST 按具体日期应用：不存在的本地时刻返回 400，歧义时刻统一取 fold=0。"
         "另提供 SQLite 持久化的会议预约接口：单事务冲突检测 + request_id 幂等，"
-        "支持带乐观版本号的改期（PUT）与软删除取消（DELETE，取消后时段立即释放）；"
-        "每次成功的创建/改期/取消都在同一事务追加 SHA-256 哈希链审计事件，"
+        "支持带乐观版本号的改期（PUT）与软删除取消（DELETE，取消后时段立即释放），"
+        "以及两条 active 预约在单个事务内互换时段的原子交换（POST swap，"
+        "排除交换双方后检查第三方冲突，任一失败整体回滚）；"
+        "每次成功的创建/改期/取消/交换都在同一事务追加 SHA-256 哈希链审计事件，"
         "可通过 GET 历史接口按序获取并由服务端重验整链。"
         "还提供预约临时保留（reservation hold）：TTL 1..900 秒的短时占位，"
         "与进行中预约及其他未过期保留在 BEGIN IMMEDIATE 事务内按半开区间检查冲突，"
@@ -83,7 +87,7 @@ app = FastAPI(
         "取消正式预约时在同一 BEGIN IMMEDIATE 事务内按 FIFO 扫描受影响候补，"
         "跳过仍冲突项，把首个可满足项原子转为正式预约并写入现有哈希链审计。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -367,6 +371,36 @@ def cancel_reservation(
         expected_version=expected_version,
     )
     return _reservation_to_out(reservation)
+
+
+@app.post("/api/v1/reservations/swap", response_model=ReservationSwapOut)
+def swap_reservation_windows(req: ReservationSwapIn) -> ReservationSwapOut:
+    """时段原子交换：两条不同的 active 预约在单个事务内互换起止时刻。
+
+    - 任一预约不存在 → 404；
+    - 任一预约已取消 → 409（取消是终态，交换不会使其复活）；
+    - 任一 ``expected_version`` 与对应预约当前版本不一致 → 409，
+      响应给出该预约的 ``current_version``；
+    - 交换后双方各自的新时段（第一条落在第二条的原时段、反之亦然）与
+      **其他**进行中预约（排除交换双方自身）或未过期保留存在参与者
+      半开区间重叠 → 409 + 冲突明细；
+    - 成功 → 200：两条预约的 ``start_utc``/``end_utc`` 互换，
+      ``version`` 各加 1，``request_id``、参与者与 ``created_at`` 不变；
+      同一事务内为双方各追加一条 ``rescheduled`` 哈希链审计事件。
+
+    所有检查与写入在单个 ``BEGIN IMMEDIATE`` 事务内完成；任一步失败
+    整体回滚，两条预约及其参与者占用、审计链均保持原状。
+    """
+    first, second = reservation_core.swap_reservations(
+        first_id=req.first.reservation_id,
+        first_expected_version=req.first.expected_version,
+        second_id=req.second.reservation_id,
+        second_expected_version=req.second.expected_version,
+    )
+    return ReservationSwapOut(
+        first=_reservation_to_out(first),
+        second=_reservation_to_out(second),
+    )
 
 
 @app.get(
