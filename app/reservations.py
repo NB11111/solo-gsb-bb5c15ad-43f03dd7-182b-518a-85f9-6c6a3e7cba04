@@ -166,11 +166,17 @@ def collect_reservation_conflicts(
     end_s: str,
     *,
     exclude_reservation_id: int | None = None,
+    exclude_reservation_ids: Iterable[int] | None = None,
 ) -> list[dict[str, object]]:
     """收集与**进行中预约**的半开区间冲突（相邻区间因等号不成立而不命中）。
 
-    ``exclude_reservation_id`` 用于改期路径排除自身旧占用。
+    ``exclude_reservation_id`` 用于改期路径排除自身旧占用；
+    ``exclude_reservation_ids`` 用于原子交换路径同时排除交换双方
+    （双方互换时段后，彼此旧占用都不应被视为冲突）。
     """
+    exclude_ids: set[int] = set(exclude_reservation_ids or ())
+    if exclude_reservation_id is not None:
+        exclude_ids.add(exclude_reservation_id)
     conflicts: list[dict[str, object]] = []
     sql = (
         "SELECT reservation_id, participant_id"
@@ -178,9 +184,12 @@ def collect_reservation_conflicts(
         " WHERE participant_id = ? AND start_utc < ? AND ? < end_utc"
     )
     params: list[object] = []
-    if exclude_reservation_id is not None:
-        sql += " AND reservation_id != ?"
-        params.append(exclude_reservation_id)
+    if exclude_ids:
+        sql += (
+            f" AND reservation_id NOT IN"
+            f" ({','.join('?' for _ in exclude_ids)})"
+        )
+        params.extend(sorted(exclude_ids))
     sql += " ORDER BY reservation_id"
     for pid in participants:
         for hit in conn.execute(sql, (pid, end_s, start_s, *params)):
@@ -472,6 +481,166 @@ def reschedule_reservation(
             raise
     finally:
         conn.close()
+
+
+def swap_reservations(
+    first_id: int,
+    first_expected_version: int,
+    second_id: int,
+    second_expected_version: int,
+    db_path: str | None = None,
+) -> tuple[Reservation, Reservation]:
+    """原子交换两条 active 预约的 ``start_utc`` / ``end_utc``。
+
+    参与者、``request_id``、``created_at`` 均保持不变；成功后两边 ``version``
+    各加 1，并分别在同一事务追加 ``rescheduled`` 哈希链事件。
+
+    整个流程在单个 ``BEGIN IMMEDIATE`` 事务内完成，任一步失败都整体回滚：
+
+    1. 存在性：任一预约不存在 → :class:`ReservationNotFoundError`（404）；
+    2. 未取消：任一预约已取消（终态）→ :class:`ReservationCanceledError`
+       （409，携带该预约 ``current_version``）；
+    3. 双版本：各自 ``expected_version`` 与当前版本不一致
+       → :class:`VersionConflictError`（409，携带该预约 ``current_version``）；
+    4. 冲突检查：交换双方**互相排除**后，各自的新时段（即对方原时段）
+       不得与**其他 active 预约**或**未过期 pending 保留**在任一位共同
+       参与者上半开区间重叠；有冲突 → :class:`ReservationConflictError`
+       （409 + 冲突明细）。双方之间（含共享参与者互换时段）不算冲突。
+
+    返回 ``(第一方交换后状态, 第二方交换后状态)``，顺序与入参一致。
+    """
+    path = db.ensure_initialized(db_path)
+    conn = db.connect(path)
+    try:
+        # BEGIN IMMEDIATE：事务开始即持写锁，
+        # “存在性 + 状态 + 双版本 + 双向冲突检查 + 互换” 对并发请求原子。
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            now_s = _canon(datetime.now(timezone.utc))
+            _expire_due_holds(conn, now_s)
+
+            rows: dict[int, sqlite3.Row] = {}
+            for rid in (first_id, second_id):
+                row = conn.execute(
+                    f"SELECT {_RESERVATION_COLUMNS} FROM reservations WHERE id = ?",
+                    (rid,),
+                ).fetchone()
+                if row is None:
+                    raise ReservationNotFoundError(rid)
+                rows[rid] = row
+
+            # 先统一校验双方未取消（取消是终态，交换不会使其复活）
+            for rid in (first_id, second_id):
+                if rows[rid]["status"] == "canceled":
+                    raise ReservationCanceledError(rid, rows[rid]["version"])
+
+            # 再统一校验双方乐观锁版本
+            expected = {
+                first_id: first_expected_version,
+                second_id: second_expected_version,
+            }
+            for rid in (first_id, second_id):
+                if expected[rid] != rows[rid]["version"]:
+                    raise VersionConflictError(rid, rows[rid]["version"])
+
+            # 互换时段：第一方新窗口 = 第二方原窗口，反之亦然
+            new_windows = {
+                first_id: (rows[second_id]["start_utc"], rows[second_id]["end_utc"]),
+                second_id: (rows[first_id]["start_utc"], rows[first_id]["end_utc"]),
+            }
+            parties = {first_id, second_id}
+
+            # 冲突检查排除交换双方：双方互换占用后彼此不冲突；
+            # 与其他 active 预约及未过期 pending 保留按半开区间检查。
+            conflicts: list[dict[str, object]] = []
+            for rid in (first_id, second_id):
+                new_start_s, new_end_s = new_windows[rid]
+                participants = tuple(json.loads(rows[rid]["participants_key"]))
+                conflicts.extend(collect_reservation_conflicts(
+                    conn, participants, new_start_s, new_end_s,
+                    exclude_reservation_ids=parties))
+                conflicts.extend(_collect_hold_conflicts(
+                    conn, participants, new_start_s, new_end_s, now_s))
+            # 同一条其他预约/保留与同一位参与者可能在两次检查中重复命中，
+            # 去重并保持输出稳定有序
+            conflicts = _dedup_conflicts(conflicts)
+            if conflicts:
+                raise ReservationConflictError(conflicts)
+
+            swapped: dict[int, Reservation] = {}
+            for rid in (first_id, second_id):
+                new_start_s, new_end_s = new_windows[rid]
+                row = rows[rid]
+                current_version = row["version"]
+                participants = tuple(json.loads(row["participants_key"]))
+
+                conn.execute(
+                    "UPDATE reservations"
+                    " SET start_utc = ?, end_utc = ?, version = version + 1"
+                    " WHERE id = ?",
+                    (new_start_s, new_end_s, rid),
+                )
+                # 参与者集合不变，仅把占用窗口整体平移到对方原时段
+                conn.executemany(
+                    "UPDATE reservation_participants"
+                    " SET start_utc = ?, end_utc = ?"
+                    " WHERE reservation_id = ? AND participant_id = ?",
+                    [(new_start_s, new_end_s, rid, pid) for pid in participants],
+                )
+                # 同事务追加 rescheduled 审计事件：快照记录互换后的新状态；
+                # request_id / created_at 沿用原值，版本 +1
+                snapshot = audit.build_snapshot(
+                    reservation_id=rid,
+                    request_id=row["request_id"],
+                    start_utc=new_start_s,
+                    end_utc=new_end_s,
+                    participants=participants,
+                    version=current_version + 1,
+                    status="active",
+                    canceled_at=None,
+                    created_at=row["created_at"],
+                )
+                audit.append_event(
+                    conn,
+                    reservation_id=rid,
+                    action="rescheduled",
+                    timestamp=now_s,
+                    snapshot=snapshot,
+                )
+                swapped[rid] = Reservation(
+                    id=rid,
+                    request_id=row["request_id"],
+                    start_utc=_parse(new_start_s),
+                    end_utc=_parse(new_end_s),
+                    participants=participants,
+                    created_at=_parse(row["created_at"]),
+                    version=current_version + 1,
+                )
+            conn.execute("COMMIT")
+            return swapped[first_id], swapped[second_id]
+        except BaseException:
+            # 无活动事务时 rollback 为 no-op；任何失败都保证整体回滚
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def _dedup_conflicts(
+    conflicts: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """冲突明细去重并按 (类型, ID, 参与者) 稳定排序。
+
+    原子交换对双方各做一次检查，同一条挡路预约/保留可能因共享参与者
+    被重复收集；去重保证响应明细每项只出现一次。
+    """
+    unique = list({tuple(sorted(c.items())) for c in conflicts})
+    unique.sort(key=lambda items: (
+        0 if "reservation_id" in dict(items) else 1,
+        dict(items).get("reservation_id") or dict(items).get("hold_id"),
+        dict(items)["participant_id"],
+    ))
+    return [dict(items) for items in unique]
 
 
 def cancel_reservation(

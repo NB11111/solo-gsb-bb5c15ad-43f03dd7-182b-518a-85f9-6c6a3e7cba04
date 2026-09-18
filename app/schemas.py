@@ -166,6 +166,38 @@ class ReservationRescheduleIn(_ReservationWindowBase):
     )
 
 
+class ReservationSwapItemIn(BaseModel):
+    """原子交换中的一方：预约 ID + 客户端上次读到的乐观锁版本。"""
+
+    reservation_id: int = Field(
+        ge=1,
+        description="参与交换的 active 预约 ID",
+        examples=[1],
+    )
+    expected_version: int = Field(
+        ge=1,
+        description="客户端上次读到的该预约版本；与当前版本一致才执行交换",
+        examples=[1],
+    )
+
+
+class ReservationSwapIn(BaseModel):
+    """两条 active 预约原子互换时段请求（参与者与 request_id 不变）。"""
+
+    first: ReservationSwapItemIn = Field(
+        description="交换的第一方（预约 ID + expected_version）",
+    )
+    second: ReservationSwapItemIn = Field(
+        description="交换的第二方（预约 ID + expected_version），须与第一方不同",
+    )
+
+    @model_validator(mode="after")
+    def _validate_distinct(self) -> "ReservationSwapIn":
+        if self.first.reservation_id == self.second.reservation_id:
+            raise ValueError("first.reservation_id and second.reservation_id must differ")
+        return self
+
+
 class ReservationHoldIn(_ReservationWindowBase):
     """临时保留创建请求：幂等 hold_key + 半开区间参与者占用 + TTL 秒数。"""
 
@@ -245,6 +277,17 @@ class ReservationOut(BaseModel):
         examples=[None],
     )
     created_at: str
+
+
+class ReservationSwapOut(BaseModel):
+    """两条预约时段原子互换后的双方最新状态（按请求中的 first/second 顺序）。"""
+
+    first: ReservationOut = Field(
+        description="交换后第一方预约的完整状态（已换到第二方原时段，version +1）",
+    )
+    second: ReservationOut = Field(
+        description="交换后第二方预约的完整状态（已换到第一方原时段，version +1）",
+    )
 
 
 class ReservationWaitlistOut(BaseModel):

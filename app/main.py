@@ -48,6 +48,8 @@ from .schemas import (
     ReservationIn,
     ReservationOut,
     ReservationRescheduleIn,
+    ReservationSwapIn,
+    ReservationSwapOut,
     ReservationWaitlistIn,
     ReservationWaitlistOut,
     SegmentOut,
@@ -82,8 +84,13 @@ app = FastAPI(
         "正式预约，否则按创建时间进入 pending 队列（相同 request_id 幂等）；"
         "取消正式预约时在同一 BEGIN IMMEDIATE 事务内按 FIFO 扫描受影响候补，"
         "跳过仍冲突项，把首个可满足项原子转为正式预约并写入现有哈希链审计。"
+        "还支持两条 active 预约的原子时段交换（reservation swap）：在单个"
+        " BEGIN IMMEDIATE 事务内互换 start_utc/end_utc（参与者与 request_id"
+        " 不变），同时校验存在性、未取消与双方乐观锁版本，并在排除交换双方后"
+        "检查新时段与其他进行中预约及未过期保留的参与者冲突；成功后两边版本"
+        "各加 1 并分别追加 rescheduled 审计事件。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -341,6 +348,35 @@ def reschedule_reservation(
         participant_ids=req.participant_ids,
     )
     return _reservation_to_out(reservation)
+
+
+@app.post("/api/v1/reservations/swap", response_model=ReservationSwapOut)
+def swap_reservations(req: ReservationSwapIn) -> ReservationSwapOut:
+    """两条 active 预约原子互换时段（参与者与 request_id 保持不变）。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成“存在性 → 未取消 → 双版本 →
+    双向冲突检查 → 互换”，任一步失败都整体回滚：
+
+    - 任一预约不存在 → ``404``；
+    - 任一预约已取消 → ``409``（取消是终态，交换不会使其复活）；
+    - 任一方 ``expected_version`` 与当前版本不一致 → ``409``，响应给出
+      该方的 ``current_version``；
+    - 排除交换双方后，任一方的新时段（即对方原时段）与**其他进行中预约**
+      或**未过期 pending 保留**在共同参与者上半开区间重叠 → ``409``
+      及冲突明细（双方互换占用不算冲突，共享参与者也可正常互换）；
+    - 成功 → 两边 ``start_utc`` / ``end_utc`` 互换，``version`` 各加 1，
+      并分别在同一事务追加 ``rescheduled`` 哈希链事件。
+    """
+    first, second = reservation_core.swap_reservations(
+        first_id=req.first.reservation_id,
+        first_expected_version=req.first.expected_version,
+        second_id=req.second.reservation_id,
+        second_expected_version=req.second.expected_version,
+    )
+    return ReservationSwapOut(
+        first=_reservation_to_out(first),
+        second=_reservation_to_out(second),
+    )
 
 
 @app.delete("/api/v1/reservations/{reservation_id}", response_model=ReservationOut)

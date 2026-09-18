@@ -2,6 +2,7 @@
 
 基于 **Python + FastAPI + 标准库 `zoneinfo`** 的会议候选时段聚合服务，
 并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、
+**两条 active 预约原子互换时段**、
 软删除取消、单事务冲突检测、**可校验的 SHA-256 哈希链变更历史**、
 **预约临时保留 / 确认**、**预约候补队列**）。
 
@@ -33,7 +34,7 @@
 ```
 app/
   scheduling.py    # 聚合核心：本地时刻换算、跨午夜拆分、扫描线、排序
-  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测、历史读取、取消后 FIFO 候补晋升
+  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、两条 active 预约原子互换时段、单事务冲突检测、历史读取、取消后 FIFO 候补晋升
   holds.py         # 临时保留核心：TTL 占位、事务内惰性过期、确认转正式预约
   waitlist.py      # 候补核心：可预约直订/否则入队、request_id 幂等、取消事务内 FIFO 扫描晋升
   audit.py         # 审计事件：canonical JSON、SHA-256 哈希链追加与整链重验
@@ -400,6 +401,111 @@ curl -s -X DELETE 'http://localhost:8000/api/v1/reservations/1?expected_version=
 
 其他错误：`404`（预约不存在）、`422`（缺少 `expected_version` 或其值 `< 1`）。
 
+### `POST /api/v1/reservations/swap`
+
+**原子交换两条预约的时段**：在单个 `BEGIN IMMEDIATE` 事务内让两条
+**不同的** active 预约互换 `start_utc` / `end_utc`，参与者与 `request_id`
+保持不变。请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `first.reservation_id` | 正整数 | 第一方预约 ID |
+| `first.expected_version` | 正整数 | 第一方客户端上次读到的版本号；与当前版本一致才执行 |
+| `second.reservation_id` | 正整数 | 第二方预约 ID（**必须与第一方不同**） |
+| `second.expected_version` | 正整数 | 第二方客户端上次读到的版本号 |
+
+语义：
+
+- 整个流程（存在性 → 未取消 → 双版本匹配 → 双向冲突检查 → 互换）在单个
+  `BEGIN IMMEDIATE` 事务内完成；**任一步失败都整体回滚**，两条预约的
+  时间、参与者占用、版本与审计事件全部保持交换前原状，不会留下单边交换。
+- 任一预约不存在 → `404`。
+- 任一预约已取消 → `409`：取消是终态，交换**不会**使其复活。
+- 任一方 `expected_version` 与当前版本不一致 → `409`，响应给出该方的
+  `current_version`；客户端重新读取后可用新版本重试。
+- 冲突检查沿用半开区间规则（相邻区间不冲突），并**同时排除交换双方**
+  （`reservation_id NOT IN (first, second)`）：双方互换后彼此的占用不算
+  冲突，**共享参与者也可正常互换时段**；但任一方换到对方原时段后，若与
+  **其他 active 预约**或**未过期 pending 保留**在共同参与者上重叠
+  → `409` 及冲突明细（`detail` + `conflicts`，结构与创建/改期接口一致）。
+- 成功时两边 `version` 各加 `1`，`request_id`、`created_at`、参与者集合
+  均不变；响应按请求中的 `first` / `second` 顺序返回两条交换后的完整预约
+  （结构同创建响应）。
+- **审计**：成功交换在同一事务为两边**分别追加一条 `rescheduled` 事件**
+  （各自哈希链上的快照为互换后的新状态，序号各自接续）；任一步失败或
+  并发落败都不产生事件。交换不触发候补晋升（仅取消会触发）。
+
+请求示例（把预约 #1 与 #2 的时段对调，两边参与者不变）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/reservations/swap \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "first":  {"reservation_id": 1, "expected_version": 1},
+    "second": {"reservation_id": 2, "expected_version": 1}
+  }'
+```
+
+成功响应（`200`；#1 换到原 #2 的 16:00–17:00，#2 换到原 #1 的 13:00–14:00，
+两边版本都推进到 2）：
+
+```json
+{
+  "first": {
+    "reservation_id": 1,
+    "request_id": "req-9f3a",
+    "start_utc": "2026-03-09T16:00:00Z",
+    "end_utc": "2026-03-09T17:00:00Z",
+    "participants": ["alice", "bob"],
+    "version": 2,
+    "status": "active",
+    "canceled_at": null,
+    "created_at": "2026-09-17T20:42:39.634009Z"
+  },
+  "second": {
+    "reservation_id": 2,
+    "request_id": "req-77bd",
+    "start_utc": "2026-03-09T13:00:00Z",
+    "end_utc": "2026-03-09T14:00:00Z",
+    "participants": ["carol"],
+    "version": 2,
+    "status": "active",
+    "canceled_at": null,
+    "created_at": "2026-09-17T20:45:10.220113Z"
+  }
+}
+```
+
+预约不存在（`404`）：
+
+```json
+{ "detail": "reservation #999 not found" }
+```
+
+一方版本过期（`409`，按报错那一方的 `current_version` 重试）：
+
+```json
+{
+  "detail": "expected_version does not match current version of reservation #2",
+  "current_version": 3
+}
+```
+
+一方已取消（`409`，不会复活）：
+
+```json
+{
+  "detail": "reservation #2 has been canceled",
+  "current_version": 4
+}
+```
+
+新时段撞上其他 active 预约或未过期保留时，返回的 `409` 结构与创建接口
+一致（`detail` + `conflicts` 明细，挡路的是保留时明细项为
+`{"hold_id": ..., "participant_id": ...}`），两条预约均保持原状。
+其他错误：`422`（两个 `reservation_id` 相同、`expected_version` /
+`reservation_id` 小于 1、缺少字段等）。
+
 ### `POST /api/v1/reservation-holds`
 
 创建**预约临时保留**（正式预约前的短时占位）。请求体：
@@ -661,7 +767,8 @@ curl -s http://localhost:8000/api/v1/reservation-waitlist/req-wait-2
   **响应不包含任何历史**，仅在 `detail` 中给出失败位置；
 - 校验通过 → `200`。
 
-**什么时候产生事件**：仅在创建/改期/取消**成功提交**时，于**同一数据库事务**
+**什么时候产生事件**：仅在创建/改期/取消**成功提交**时（原子交换成功时
+为两边各追加一条 `rescheduled` 事件），于**同一数据库事务**
 内追加一条事件（与业务写入同生共死，不会出现有预约无事件或反之）；
 失败请求（冲突、版本不符等）与**幂等重放**（相同 `request_id` 重试创建、
 原 `expected_version` 重试取消）**不产生事件**。
@@ -764,6 +871,11 @@ for ev in history["events"]:
   **取消**：软删除置 `canceled` 并记录 `canceled_at`、版本递增、
   占用同事务释放使时段立即可再约、原 `expected_version` 重试幂等返回
   同一结果、其他版本 409、取消后改期 409 不复活、并发取消仅一次实际变更；
+  **原子交换**：两条 active 预约在单事务互换时段、参与者/request_id 不变、
+  两边版本各 +1、共享参与者可互换（双方互相排除）、与第三方预约/未过期
+  保留冲突 409 且整体回滚无单边交换、不存在 404、已取消 409、任一方版本
+  过期 409 并回传该方 current_version、同 ID/非法版本 422、失败不产生事件、
+  并发交换仅一个赢家；
   以及**旧版数据库启动时无损补齐 `version=1`、`status='active'`、
   `canceled_at=NULL`** 的迁移。
 - **变更历史（哈希链）**：成功创建/改期/取消各在同事务追加事件、序号从 1
